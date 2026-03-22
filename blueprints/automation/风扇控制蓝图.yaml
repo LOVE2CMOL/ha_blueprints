@@ -117,11 +117,11 @@ blueprint:
         30:50
         35:80
         40:100
-      default: |
-        25:20
-        30:50
-        35:80
-        40:100
+      default: 
+        25: 20
+        30: 50
+        35: 80
+        40: 100
       selector:
         object:
     
@@ -171,22 +171,33 @@ trigger:
     id: fan_state_change
 
 # 条件
-condition:
-  - condition: template
-    value_template: |
-      {{ states(!input temperature_sensor) not in ['unknown', 'unavailable'] }}
-  - !input enable_condition
+condition: !input enable_condition
 
 # 动作
 action:
-  # 获取当前值
+  # 获取所有输入值到变量
   - variables:
-      current_temp: "{{ states(!input temperature_sensor) | float }}"
-      fan_state: "{{ states(!input fan) }}"
-      current_speed: "{{ state_attr(!input fan, 'percentage') | default(0) }}"
-      turn_off_temp: "{{ !input turn_off_temp | float }}"
-      turn_on_temp: "{{ !input turn_on_temp | float }}"
-      hysteresis: "{{ !input hysteresis | float }}"
+      temp_sensor: !input temperature_sensor
+      fan_entity: !input fan
+      turn_off_temp: !input turn_off_temp
+      turn_on_temp: !input turn_on_temp
+      hysteresis: !input hysteresis
+      control_mode: !input control_mode
+      min_speed_temp: !input min_speed_temp
+      max_speed_temp: !input max_speed_temp
+      min_speed: !input min_speed
+      max_speed: !input max_speed
+      interval_points: !input interval_points
+  
+  # 获取当前状态值
+  - variables:
+      current_temp: "{{ states(temp_sensor) | float(0) }}"
+      fan_state: "{{ states(fan_entity) }}"
+      current_speed: "{{ state_attr(fan_entity, 'percentage') | default(0) }}"
+  
+  # 确保温度值有效
+  - condition: template
+    value_template: "{{ current_temp > -50 and current_temp < 150 }}"
   
   # 判断是否需要开关风扇（带滞回）
   - variables:
@@ -224,38 +235,39 @@ action:
           # 计算目标转速
           - variables:
               target_speed: >
-                {% set control_mode = !input control_mode %}
-                {% set current_temp = current_temp %}
-                {% set min_speed = !input min_speed | float %}
-                {% set max_speed = !input max_speed | float %}
-                
                 {% if control_mode == 'linear' %}
                   {# 线性控制模式 #}
-                  {% set min_temp = !input min_speed_temp | float %}
-                  {% set max_temp = !input max_speed_temp | float %}
+                  {% set min_temp = min_speed_temp | float %}
+                  {% set max_temp = max_speed_temp | float %}
+                  {% set min_spd = min_speed | float %}
+                  {% set max_spd = max_speed | float %}
+                  {% set current = current_temp %}
                   
-                  {% if current_temp <= min_temp %}
-                    {{ min_speed }}
-                  {% elif current_temp >= max_temp %}
-                    {{ max_speed }}
+                  {% if current <= min_temp %}
+                    {{ min_spd }}
+                  {% elif current >= max_temp %}
+                    {{ max_spd }}
                   {% else %}
-                    {% set ratio = (current_temp - min_temp) / (max_temp - min_temp) %}
-                    {{ (min_speed + ratio * (max_speed - min_speed)) | round(0) }}
+                    {% set ratio = (current - min_temp) / (max_temp - min_temp) %}
+                    {{ (min_spd + ratio * (max_spd - min_spd)) | round(0) }}
                   {% endif %}
                   
                 {% else %}
                   {# 区间控制模式 #}
-                  {% set points = !input interval_points %}
+                  {% set points = interval_points %}
+                  {% set min_spd = min_speed | float %}
+                  {% set max_spd = max_speed | float %}
+                  {% set current = current_temp %}
                   {% set sorted_points = points.items() | sort(attribute='0') %}
-                  {% set ns = namespace(speed=min_speed) %}
+                  {% set ns = namespace(speed=min_spd) %}
                   
                   {% for temp_point, speed_point in sorted_points %}
-                    {% if current_temp >= temp_point | float %}
+                    {% if current >= temp_point | float %}
                       {% set ns.speed = speed_point | float %}
                     {% endif %}
                   {% endfor %}
                   
-                  {{ [ns.speed, min_speed, max_speed] | sort | slice(1,2) | first | round(0) }}
+                  {{ [ns.speed, min_spd, max_spd] | sort | first if ns.speed < min_spd else ([ns.speed, min_spd, max_spd] | sort | last if ns.speed > max_spd else ns.speed) | round(0) }}
                 {% endif %}
           
           # 如果风扇未开启或转速需要更新
@@ -276,14 +288,12 @@ action:
                     target:
                       entity_id: !input fan
                   
-              
               # 设置转速
               - service: fan.set_percentage
                 target:
                   entity_id: !input fan
                 data:
                   percentage: "{{ target_speed }}"
-
               
               # 记录日志
               - service: system_log.write
@@ -304,7 +314,6 @@ action:
           - service: fan.turn_off
             target:
               entity_id: !input fan
-
           
           # 记录日志
           - service: system_log.write
