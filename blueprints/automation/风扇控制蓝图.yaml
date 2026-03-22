@@ -65,7 +65,7 @@ blueprint:
     # 线性控制参数
     min_speed_temp:
       name: 最低转速温度（℃）
-      description: 达到此温度时风扇以最低转速运行（需大于启动温度）
+      description: 达到此温度时风扇以最低转速运行
       default: 25
       selector:
         number:
@@ -199,57 +199,14 @@ action:
   - condition: template
     value_template: "{{ current_temp > -50 and current_temp < 150 }}"
   
-  # 获取上次决策状态（使用输入框变量存储）
-  - variables:
-      last_decision: "{{ this.attributes.get('last_decision', 'off') }}"
-  
-  # 判断是否应该开启（带滞回）
+  # 判断是否应该开启（使用简化的滞回逻辑：直接比较阈值）
   - variables:
       should_be_on: >
-        {% if last_decision == 'off' %}
-          {{ current_temp > (on_temp + hyst) }}
-        {% else %}
+        {% if fan_state == 'on' %}
           {{ current_temp > (off_temp - hyst) }}
-        {% endif %}
-  
-  # 计算目标转速（如果需要开启）
-  - variables:
-      target_speed: >
-        {% if should_be_on %}
-          {% if mode == 'linear' %}
-            {% if current_temp <= min_temp %}
-              {{ min_spd }}
-            {% elif current_temp >= max_temp %}
-              {{ max_spd }}
-            {% else %}
-              {% set ratio = (current_temp - min_temp) / (max_temp - min_temp) %}
-              {{ (min_spd + ratio * (max_spd - min_spd)) | round(0) }}
-            {% endif %}
-          {% else %}
-            {% set speed = min_spd %}
-            {% for t, s in points.items() %}
-              {% if current_temp >= t | float %}
-                {% set speed = s | float %}
-              {% endif %}
-            {% endfor %}
-            {% if speed < min_spd %}
-              {{ min_spd }}
-            {% elif speed > max_spd %}
-              {{ max_spd }}
-            {% else %}
-              {{ speed | round(0) }}
-            {% endif %}
-          {% endif %}
         {% else %}
-          {{ 0 }}
+          {{ current_temp > (on_temp + hyst) }}
         {% endif %}
-  
-  # 存储当前决策状态到自动化属性
-  - service: automation.turn_on
-    data:
-      last_decision: "{{ 'on' if should_be_on else 'off' }}"
-    target:
-      entity_id: this
   
   # 执行风扇控制
   - choose:
@@ -258,6 +215,35 @@ action:
           - condition: template
             value_template: "{{ should_be_on }}"
         sequence:
+          # 计算目标转速
+          - variables:
+              target_speed: >
+                {% if mode == 'linear' %}
+                  {% if current_temp <= min_temp %}
+                    {{ min_spd }}
+                  {% elif current_temp >= max_temp %}
+                    {{ max_spd }}
+                  {% else %}
+                    {% set ratio = (current_temp - min_temp) / (max_temp - min_temp) %}
+                    {{ (min_spd + ratio * (max_spd - min_spd)) | round(0) }}
+                  {% endif %}
+                {% else %}
+                  {% set speed = min_spd %}
+                  {% for t, s in points.items() %}
+                    {% if current_temp >= t | float %}
+                      {% set speed = s | float %}
+                    {% endif %}
+                  {% endfor %}
+                  {% if speed < min_spd %}
+                    {{ min_spd }}
+                  {% elif speed > max_spd %}
+                    {{ max_spd }}
+                  {% else %}
+                    {{ speed | round(0) }}
+                  {% endif %}
+                {% endif %}
+          
+          # 开启或调整风扇
           - if:
               - condition: template
                 value_template: "{{ fan_state != 'on' or target_speed != current_speed }}"
@@ -276,9 +262,8 @@ action:
                   percentage: "{{ target_speed }}"
               - service: system_log.write
                 data:
-                  message: "风扇已调节: 温度={{ current_temp }}℃, 转速={{ target_speed }}%, 状态=开启"
+                  message: "风扇已调节: 温度={{ current_temp }}℃, 转速={{ target_speed }}%"
                   level: info
-                  logger: custom_components.fan_control
       
       # 需要关闭风扇
       - conditions:
@@ -292,4 +277,3 @@ action:
             data:
               message: "风扇已关闭: 温度={{ current_temp }}℃"
               level: info
-              logger: custom_components.fan_control
