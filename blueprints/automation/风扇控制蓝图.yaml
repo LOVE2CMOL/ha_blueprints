@@ -188,7 +188,6 @@ action:
       min_spd: !input min_speed
       max_spd: !input max_speed
       points: !input interval_points
-      delay_sec: !input update_delay
   
   # 获取当前状态
   - variables:
@@ -200,56 +199,72 @@ action:
   - condition: template
     value_template: "{{ current_temp > -50 and current_temp < 150 }}"
   
+  # 获取上次决策状态（使用输入框变量存储）
+  - variables:
+      last_decision: "{{ this.attributes.get('last_decision', 'off') }}"
+  
   # 判断是否应该开启（带滞回）
   - variables:
       should_be_on: >
-        {% set last = this.attributes.last_decision | default('off') %}
-        {% if last == 'off' %}
+        {% if last_decision == 'off' %}
           {{ current_temp > (on_temp + hyst) }}
         {% else %}
           {{ current_temp > (off_temp - hyst) }}
         {% endif %}
   
-  # 存储决策状态
+  # 计算目标转速（如果需要开启）
+  - variables:
+      target_speed: >
+        {% if should_be_on %}
+          {% if mode == 'linear' %}
+            {% if current_temp <= min_temp %}
+              {{ min_spd }}
+            {% elif current_temp >= max_temp %}
+              {{ max_spd }}
+            {% else %}
+              {% set ratio = (current_temp - min_temp) / (max_temp - min_temp) %}
+              {{ (min_spd + ratio * (max_spd - min_spd)) | round(0) }}
+            {% endif %}
+          {% else %}
+            {% set speed = min_spd %}
+            {% for t, s in points.items() %}
+              {% if current_temp >= t | float %}
+                {% set speed = s | float %}
+              {% endif %}
+            {% endfor %}
+            {% if speed < min_spd %}
+              {{ min_spd }}
+            {% elif speed > max_spd %}
+              {{ max_spd }}
+            {% else %}
+              {{ speed | round(0) }}
+            {% endif %}
+          {% endif %}
+        {% else %}
+          {{ 0 }}
+        {% endif %}
+  
+  # 存储当前决策状态到自动化属性
   - service: automation.turn_on
-    target:
-      entity_id: this
     data:
       last_decision: "{{ 'on' if should_be_on else 'off' }}"
+    target:
+      entity_id: this
   
-  # 执行操作
+  # 执行风扇控制
   - choose:
-      # 需要开启风扇
+      # 需要开启或调整风扇
       - conditions:
-          - "{{ should_be_on }}"
+          - condition: template
+            value_template: "{{ should_be_on }}"
         sequence:
-          # 计算目标转速
-          - variables:
-              target_speed: >
-                {% if mode == 'linear' %}
-                  {% if current_temp <= min_temp %}
-                    {{ min_spd }}
-                  {% elif current_temp >= max_temp %}
-                    {{ max_spd }}
-                  {% else %}
-                    {% set ratio = (current_temp - min_temp) / (max_temp - min_temp) %}
-                    {{ (min_spd + ratio * (max_spd - min_spd)) | round(0) }}
-                  {% endif %}
-                {% else %}
-                  {% set speed = min_spd %}
-                  {% for t, s in points.items() %}
-                    {% if current_temp >= t | float %}
-                      {% set speed = s | float %}
-                    {% endif %}
-                  {% endfor %}
-                  {{ [speed, min_spd, max_spd] | sort | first if speed < min_spd else ([speed, min_spd, max_spd] | sort | last if speed > max_spd else speed) | round(0) }}
-                {% endif %}
-          
-          # 如果需要开启或调整转速
           - if:
-              - "{{ fan_state != 'on' or target_speed != current_speed }}"
+              - condition: template
+                value_template: "{{ fan_state != 'on' or target_speed != current_speed }}"
             then:
-              - if: "{{ fan_state != 'on' }}"
+              - if:
+                  - condition: template
+                    value_template: "{{ fan_state != 'on' }}"
                 then:
                   - service: fan.turn_on
                     target:
@@ -261,17 +276,20 @@ action:
                   percentage: "{{ target_speed }}"
               - service: system_log.write
                 data:
-                  message: "风扇开启: 温度={{ current_temp }}℃, 转速={{ target_speed }}%"
+                  message: "风扇已调节: 温度={{ current_temp }}℃, 转速={{ target_speed }}%, 状态=开启"
                   level: info
+                  logger: custom_components.fan_control
       
       # 需要关闭风扇
       - conditions:
-          - "{{ not should_be_on and fan_state == 'on' }}"
+          - condition: template
+            value_template: "{{ not should_be_on and fan_state == 'on' }}"
         sequence:
           - service: fan.turn_off
             target:
               entity_id: !input fan
           - service: system_log.write
             data:
-              message: "风扇关闭: 温度={{ current_temp }}℃"
+              message: "风扇已关闭: 温度={{ current_temp }}℃"
               level: info
+              logger: custom_components.fan_control
