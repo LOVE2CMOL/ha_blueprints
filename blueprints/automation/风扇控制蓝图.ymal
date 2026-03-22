@@ -182,33 +182,44 @@ trigger:
 # 条件
 condition:
   - condition: template
-    value_template: |
-      {{ states(!input temperature_sensor) not in ['unknown', 'unavailable'] }}
+    value_template: "{{ states(input_temperature_sensor) not in ['unknown', 'unavailable'] }}"
   - !input enable_condition
 
 # 动作
 action:
-  # 获取当前值
+  # 获取输入值到变量
   - variables:
-      current_temp: "{{ states(!input temperature_sensor) | float }}"
-      fan_state: "{{ states(!input fan) }}"
-      current_speed: "{{ state_attr(!input fan, 'percentage') | default(0) }}"
-      turn_off_temp: "{{ !input turn_off_temp | float }}"
-      turn_on_temp: "{{ !input turn_on_temp | float }}"
-      hysteresis: "{{ !input hysteresis | float }}"
+      input_temperature_sensor: !input temperature_sensor
+      input_fan: !input fan
+      input_turn_off_temp: !input turn_off_temp
+      input_turn_on_temp: !input turn_on_temp
+      input_hysteresis: !input hysteresis
+      input_control_mode: !input control_mode
+      input_min_speed_temp: !input min_speed_temp
+      input_max_speed_temp: !input max_speed_temp
+      input_min_speed: !input min_speed
+      input_max_speed: !input max_speed
+      input_interval_points: !input interval_points
+      input_notify_device: !input notify_device
+  
+  # 获取当前状态值
+  - variables:
+      current_temp: "{{ states(input_temperature_sensor) | float(0) }}"
+      fan_state: "{{ states(input_fan) }}"
+      current_speed: "{{ state_attr(input_fan, 'percentage') | default(0) }}"
+      turn_off_temp: "{{ input_turn_off_temp | float }}"
+      turn_on_temp: "{{ input_turn_on_temp | float }}"
+      hysteresis: "{{ input_hysteresis | float }}"
   
   # 判断是否需要开关风扇（带滞回）
   - variables:
+      last_decision: "{{ this.attributes.last_decision | default('off') }}"
       should_be_on: >
         {% set temp = current_temp %}
         {% set off_temp = turn_off_temp %}
         {% set on_temp = turn_on_temp %}
         {% set hys = hysteresis %}
         
-        {# 获取上次决策状态，如果没有则默认为关闭 #}
-        {% set last_decision = this.attributes.last_decision | default('off') %}
-        
-        {# 应用滞回逻辑 #}
         {% if last_decision == 'off' %}
           {# 当前是关闭状态，需要温度超过启动温度+滞回才开启 #}
           {{ temp > (on_temp + hys) }}
@@ -233,15 +244,15 @@ action:
           # 计算目标转速
           - variables:
               target_speed: >
-                {% set control_mode = !input control_mode %}
+                {% set control_mode = input_control_mode %}
                 {% set current_temp = current_temp %}
-                {% set min_speed = !input min_speed | float %}
-                {% set max_speed = !input max_speed | float %}
+                {% set min_speed = input_min_speed | float %}
+                {% set max_speed = input_max_speed | float %}
                 
                 {% if control_mode == 'linear' %}
                   {# 线性控制模式 #}
-                  {% set min_temp = !input min_speed_temp | float %}
-                  {% set max_temp = !input max_speed_temp | float %}
+                  {% set min_temp = input_min_speed_temp | float %}
+                  {% set max_temp = input_max_speed_temp | float %}
                   
                   {% if current_temp <= min_temp %}
                     {{ min_speed }}
@@ -254,17 +265,25 @@ action:
                   
                 {% else %}
                   {# 区间控制模式 #}
-                  {% set points = !input interval_points %}
+                  {% set points_str = input_interval_points %}
+                  {# 解析YAML格式的区间点 #}
+                  {% set points = {} %}
+                  {% for line in points_str.split('\n') %}
+                    {% if ':' in line and line.strip() %}
+                      {% set parts = line.strip().split(':') %}
+                      {% set _ = points.update({parts[0]|float: parts[1]|float}) %}
+                    {% endif %}
+                  {% endfor %}
                   {% set sorted_points = points.items() | sort(attribute='0') %}
                   {% set ns = namespace(speed=min_speed) %}
                   
                   {% for temp_point, speed_point in sorted_points %}
-                    {% if current_temp >= temp_point | float %}
-                      {% set ns.speed = speed_point | float %}
+                    {% if current_temp >= temp_point %}
+                      {% set ns.speed = speed_point %}
                     {% endif %}
                   {% endfor %}
                   
-                  {{ [ns.speed, min_speed, max_speed] | sort | slice(1,2) | first | round(0) }}
+                  {{ [ns.speed, min_speed, max_speed] | sort | first if ns.speed < min_speed else [ns.speed, min_speed, max_speed] | sort | last if ns.speed > max_speed else ns.speed }}
                 {% endif %}
           
           # 如果风扇未开启或转速需要更新
@@ -283,14 +302,14 @@ action:
                 then:
                   - service: fan.turn_on
                     target:
-                      entity_id: !input fan
+                      entity_id: "{{ input_fan }}"
                   
                   # 发送开启通知
                   - if:
                       - condition: template
-                        value_template: "{{ !input notify_device | length > 0 }}"
+                        value_template: "{{ input_notify_device | length > 0 }}"
                     then:
-                      - service: notify.mobile_app_{{ !input notify_device }}
+                      - service: "notify.mobile_app_{{ input_notify_device }}"
                         data:
                           title: "风扇已开启"
                           message: "温度 {{ current_temp }}℃ 超过启动温度 {{ turn_on_temp }}℃"
@@ -300,16 +319,16 @@ action:
               # 设置转速
               - service: fan.set_percentage
                 target:
-                  entity_id: !input fan
+                  entity_id: "{{ input_fan }}"
                 data:
                   percentage: "{{ target_speed }}"
               
               # 发送转速通知
               - if:
                   - condition: template
-                    value_template: "{{ !input notify_device | length > 0 and target_speed != current_speed }}"
+                    value_template: "{{ input_notify_device | length > 0 and target_speed != current_speed }}"
                 then:
-                  - service: notify.mobile_app_{{ !input notify_device }}
+                  - service: "notify.mobile_app_{{ input_notify_device }}"
                     data:
                       title: "风扇转速已调整"
                       message: "温度 {{ current_temp }}℃ → 转速 {{ target_speed }}%"
@@ -334,14 +353,14 @@ action:
         sequence:
           - service: fan.turn_off
             target:
-              entity_id: !input fan
+              entity_id: "{{ input_fan }}"
           
           # 发送关闭通知
           - if:
               - condition: template
-                value_template: "{{ !input notify_device | length > 0 }}"
+                value_template: "{{ input_notify_device | length > 0 }}"
             then:
-              - service: notify.mobile_app_{{ !input notify_device }}
+              - service: "notify.mobile_app_{{ input_notify_device }}"
                 data:
                   title: "风扇已关闭"
                   message: "温度 {{ current_temp }}℃ 低于关闭温度 {{ turn_off_temp }}℃"
@@ -357,7 +376,3 @@ action:
                 启动温度={{ turn_on_temp }}℃
               level: info
               logger: custom_components.fan_control
-
-# 存储状态到自动化属性
-variables:
-  last_decision: "{{ this.attributes.last_decision | default('off') }}"
