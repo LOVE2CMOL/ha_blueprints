@@ -1,0 +1,363 @@
+blueprint:
+  name: "智能温度控制风扇（带开关阈值）"
+  description: |
+    根据温度自动控制风扇开关和转速
+    - 低于关闭温度：风扇关闭
+    - 高于启动温度：风扇开启并根据温度调节转速
+    - 中间区间：保持上次状态（避免频繁启停）
+  domain: automation
+  input:
+    # 温度传感器
+    temperature_sensor:
+      name: 温度传感器
+      description: 用于监测温度的设备
+      selector:
+        entity:
+          domain: sensor
+          device_class: temperature
+          multiple: false
+    
+    # 风扇设备
+    fan:
+      name: 风扇
+      description: 需要控制的风扇设备
+      selector:
+        entity:
+          domain: fan
+          multiple: false
+    
+    # 温度阈值
+    turn_off_temp:
+      name: 关闭温度（℃）
+      description: 低于此温度时关闭风扇
+      default: 20
+      selector:
+        number:
+          min: 0
+          max: 50
+          step: 0.5
+          unit_of_measurement: "℃"
+    
+    turn_on_temp:
+      name: 启动温度（℃）
+      description: 高于此温度时开启风扇
+      default: 25
+      selector:
+        number:
+          min: 0
+          max: 60
+          step: 0.5
+          unit_of_measurement: "℃"
+    
+    # 控制模式
+    control_mode:
+      name: 转速控制模式
+      description: 选择风扇开启后的转速控制方式
+      default: "linear"
+      selector:
+        select:
+          options:
+            - label: 线性控制（平滑过渡）
+              value: "linear"
+            - label: 区间控制（阶梯式）
+              value: "interval"
+    
+    # 线性控制参数
+    min_speed_temp:
+      name: 最低转速温度（℃）
+      description: 达到此温度时风扇以最低转速运行（需大于启动温度）
+      default: 25
+      selector:
+        number:
+          min: 0
+          max: 60
+          step: 0.5
+          unit_of_measurement: "℃"
+    
+    max_speed_temp:
+      name: 最高转速温度（℃）
+      description: 达到此温度时风扇以最高转速运行
+      default: 35
+      selector:
+        number:
+          min: 10
+          max: 70
+          step: 0.5
+          unit_of_measurement: "℃"
+    
+    min_speed:
+      name: 最低转速（%）
+      description: 风扇开启后的最低转速百分比
+      default: 20
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 5
+          unit_of_measurement: "%"
+    
+    max_speed:
+      name: 最高转速（%）
+      description: 风扇允许的最高转速百分比
+      default: 100
+      selector:
+        number:
+          min: 0
+          max: 100
+          step: 5
+          unit_of_measurement: "%"
+    
+    # 区间控制参数
+    interval_points:
+      name: 区间控制点
+      description: |
+        温度与转速对应关系，格式：温度:转速
+        每行一个，例如：
+        25:20
+        30:50
+        35:80
+        40:100
+      default: |
+        25:20
+        30:50
+        35:80
+        40:100
+      selector:
+        object:
+    
+    # 高级设置
+    hysteresis:
+      name: 滞回值（℃）
+      description: 避免在阈值附近频繁开关的温度死区
+      default: 1.0
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 0.1
+          unit_of_measurement: "℃"
+    
+    update_delay:
+      name: 更新延迟（秒）
+      description: 温度稳定后才执行操作
+      default: 10
+      selector:
+        number:
+          min: 0
+          max: 60
+          step: 1
+          unit_of_measurement: "秒"
+    
+    # 运行条件（可选）
+    enable_condition:
+      name: 启用条件（可选）
+      description: 满足此条件时才运行自动化
+      default: []
+      selector:
+        condition:
+    
+    # 通知设备（可选）
+    notify_device:
+      name: 通知设备（可选）
+      description: 状态变化时发送通知
+      default: []
+      selector:
+        device:
+          integration: mobile_app
+
+# 触发器
+trigger:
+  - platform: state
+    entity_id: !input temperature_sensor
+    id: temperature_change
+    for:
+      seconds: !input update_delay
+  - platform: homeassistant
+    event: start
+    id: hass_start
+  - platform: state
+    entity_id: !input fan
+    id: fan_state_change
+
+# 条件
+condition:
+  - condition: template
+    value_template: |
+      {{ states(!input temperature_sensor) not in ['unknown', 'unavailable'] }}
+  - !input enable_condition
+
+# 动作
+action:
+  # 获取当前值
+  - variables:
+      current_temp: "{{ states(!input temperature_sensor) | float }}"
+      fan_state: "{{ states(!input fan) }}"
+      current_speed: "{{ state_attr(!input fan, 'percentage') | default(0) }}"
+      turn_off_temp: "{{ !input turn_off_temp | float }}"
+      turn_on_temp: "{{ !input turn_on_temp | float }}"
+      hysteresis: "{{ !input hysteresis | float }}"
+  
+  # 判断是否需要开关风扇（带滞回）
+  - variables:
+      should_be_on: >
+        {% set temp = current_temp %}
+        {% set off_temp = turn_off_temp %}
+        {% set on_temp = turn_on_temp %}
+        {% set hys = hysteresis %}
+        
+        {# 获取上次决策状态，如果没有则默认为关闭 #}
+        {% set last_decision = this.attributes.last_decision | default('off') %}
+        
+        {# 应用滞回逻辑 #}
+        {% if last_decision == 'off' %}
+          {# 当前是关闭状态，需要温度超过启动温度+滞回才开启 #}
+          {{ temp > (on_temp + hys) }}
+        {% else %}
+          {# 当前是开启状态，需要温度低于关闭温度-滞回才关闭 #}
+          {{ temp > (off_temp - hys) }}
+        {% endif %}
+  
+  # 存储当前决策状态
+  - event: set_variable
+    event_data:
+      name: last_decision
+      value: "{{ 'on' if should_be_on else 'off' }}"
+  
+  # 根据决策执行操作
+  - choose:
+      # 情况1：需要开启风扇
+      - conditions:
+          - condition: template
+            value_template: "{{ should_be_on }}"
+        sequence:
+          # 计算目标转速
+          - variables:
+              target_speed: >
+                {% set control_mode = !input control_mode %}
+                {% set current_temp = current_temp %}
+                {% set min_speed = !input min_speed | float %}
+                {% set max_speed = !input max_speed | float %}
+                
+                {% if control_mode == 'linear' %}
+                  {# 线性控制模式 #}
+                  {% set min_temp = !input min_speed_temp | float %}
+                  {% set max_temp = !input max_speed_temp | float %}
+                  
+                  {% if current_temp <= min_temp %}
+                    {{ min_speed }}
+                  {% elif current_temp >= max_temp %}
+                    {{ max_speed }}
+                  {% else %}
+                    {% set ratio = (current_temp - min_temp) / (max_temp - min_temp) %}
+                    {{ (min_speed + ratio * (max_speed - min_speed)) | round(0) }}
+                  {% endif %}
+                  
+                {% else %}
+                  {# 区间控制模式 #}
+                  {% set points = !input interval_points %}
+                  {% set sorted_points = points.items() | sort(attribute='0') %}
+                  {% set ns = namespace(speed=min_speed) %}
+                  
+                  {% for temp_point, speed_point in sorted_points %}
+                    {% if current_temp >= temp_point | float %}
+                      {% set ns.speed = speed_point | float %}
+                    {% endif %}
+                  {% endfor %}
+                  
+                  {{ [ns.speed, min_speed, max_speed] | sort | slice(1,2) | first | round(0) }}
+                {% endif %}
+          
+          # 如果风扇未开启或转速需要更新
+          - if:
+              - condition: or
+                conditions:
+                  - condition: template
+                    value_template: "{{ fan_state != 'on' }}"
+                  - condition: template
+                    value_template: "{{ target_speed != current_speed }}"
+            then:
+              # 先开启风扇（如果需要）
+              - if:
+                  - condition: template
+                    value_template: "{{ fan_state != 'on' }}"
+                then:
+                  - service: fan.turn_on
+                    target:
+                      entity_id: !input fan
+                  
+                  # 发送开启通知
+                  - if:
+                      - condition: template
+                        value_template: "{{ !input notify_device | length > 0 }}"
+                    then:
+                      - service: notify.mobile_app_{{ !input notify_device }}
+                        data:
+                          title: "风扇已开启"
+                          message: "温度 {{ current_temp }}℃ 超过启动温度 {{ turn_on_temp }}℃"
+                          data:
+                            tag: fan_status
+              
+              # 设置转速
+              - service: fan.set_percentage
+                target:
+                  entity_id: !input fan
+                data:
+                  percentage: "{{ target_speed }}"
+              
+              # 发送转速通知
+              - if:
+                  - condition: template
+                    value_template: "{{ !input notify_device | length > 0 and target_speed != current_speed }}"
+                then:
+                  - service: notify.mobile_app_{{ !input notify_device }}
+                    data:
+                      title: "风扇转速已调整"
+                      message: "温度 {{ current_temp }}℃ → 转速 {{ target_speed }}%"
+                      data:
+                        tag: fan_speed
+              
+              # 记录日志
+              - service: system_log.write
+                data:
+                  message: >
+                    风扇已开启: 温度={{ current_temp }}℃,
+                    转速={{ target_speed }}%,
+                    启动温度={{ turn_on_temp }}℃,
+                    关闭温度={{ turn_off_temp }}℃
+                  level: info
+                  logger: custom_components.fan_control
+      
+      # 情况2：需要关闭风扇
+      - conditions:
+          - condition: template
+            value_template: "{{ not should_be_on and fan_state == 'on' }}"
+        sequence:
+          - service: fan.turn_off
+            target:
+              entity_id: !input fan
+          
+          # 发送关闭通知
+          - if:
+              - condition: template
+                value_template: "{{ !input notify_device | length > 0 }}"
+            then:
+              - service: notify.mobile_app_{{ !input notify_device }}
+                data:
+                  title: "风扇已关闭"
+                  message: "温度 {{ current_temp }}℃ 低于关闭温度 {{ turn_off_temp }}℃"
+                  data:
+                    tag: fan_status
+          
+          # 记录日志
+          - service: system_log.write
+            data:
+              message: >
+                风扇已关闭: 温度={{ current_temp }}℃,
+                关闭温度={{ turn_off_temp }}℃,
+                启动温度={{ turn_on_temp }}℃
+              level: info
+              logger: custom_components.fan_control
+
+# 存储状态到自动化属性
+variables:
+  last_decision: "{{ this.attributes.last_decision | default('off') }}"
